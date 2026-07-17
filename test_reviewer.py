@@ -163,5 +163,85 @@ class PermissionRequestDeferOnErrorTests(unittest.TestCase):
         self.assertEqual(raised.code if raised else 0, 0)
 
 
+class ToolInputTrimTests(unittest.TestCase):
+    """Large tool_input fields are spilled to a temp file for the reviewer LLM;
+    short high-signal fields stay inline; temp files are cleaned up after the
+    review() call returns (even on failure). Audit keeps a much fuller copy."""
+
+    def tearDown(self):
+        # safety net: remove any reviewer_ctx_ temp files left by failed asserts
+        import glob, tempfile
+        for p in glob.glob(os.path.join(tempfile.gettempdir(), "reviewer_ctx_*.txt")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def test_small_input_not_spilled(self):
+        ti = {"file_path": "/tmp/x.py", "content": "print('hi')\n"}
+        trimmed, temps = reviewer._trim_tool_input_for_llm(ti, {})
+        self.assertEqual(temps, [])
+        self.assertEqual(trimmed, ti)
+
+    def test_large_content_spilled_with_preview_sha_size_path(self):
+        big = "A" * 10000
+        ti = {"file_path": "/tmp/big.py", "content": big}
+        trimmed, temps = reviewer._trim_tool_input_for_llm(ti, {})
+        try:
+            self.assertEqual(len(temps), 1)
+            self.assertTrue(os.path.exists(temps[0]))
+            # file_path stays inline (short, high-signal)
+            self.assertEqual(trimmed["file_path"], "/tmp/big.py")
+            spilled = trimmed["content"]
+            self.assertTrue(spilled["_truncated"])
+            self.assertEqual(spilled["size_bytes"], 10000)
+            self.assertEqual(spilled["sha256"],
+                             __import__("hashlib").sha256(big.encode()).hexdigest())
+            self.assertTrue(spilled["preview"].startswith("A"))
+            self.assertTrue(spilled["preview"].endswith("...[truncated]"))
+            self.assertLessEqual(len(spilled["preview"]), 2000 + len("...[truncated]"))
+            self.assertEqual(spilled["full_content_path"], temps[0])
+            # temp file holds the full content
+            with open(temps[0]) as f:
+                self.assertEqual(f.read(), big)
+        finally:
+            for t in temps:
+                os.remove(t)
+
+    def test_short_high_signal_fields_stay_inline(self):
+        # command and file_path are short -> never spilled, even alongside a big field
+        big = "Z" * 5000
+        ti = {"command": "ls -la", "file_path": "/tmp/x", "content": big}
+        trimmed, temps = reviewer._trim_tool_input_for_llm(ti, {})
+        try:
+            self.assertEqual(trimmed["command"], "ls -la")
+            self.assertEqual(trimmed["file_path"], "/tmp/x")
+            self.assertTrue(trimmed["content"]["_truncated"])
+            self.assertEqual(len(temps), 1)
+        finally:
+            for t in temps:
+                os.remove(t)
+
+    def test_review_cleans_up_temp_files_even_on_llm_failure(self):
+        # review() must delete spilled temp files in its finally block, even when
+        # _call_llm raises (network/crash). Monkeypatch _call_llm to raise.
+        big = "B" * 6000
+        ti = {"file_path": "/tmp/big2.py", "content": big}
+        original_call = reviewer._call_llm
+        def _boom(*a, **k):
+            raise ConnectionError("simulated proxy outage")
+        reviewer._call_llm = _boom
+        try:
+            result = reviewer.review("Write", ti, "/tmp", {}, {"fail_closed": True}, "default")
+        finally:
+            reviewer._call_llm = original_call
+        # fail_closed -> deny on LLM failure
+        self.assertEqual(result["decision"], "deny")
+        # all spilled temp files must be gone
+        import glob, tempfile
+        leftover = glob.glob(os.path.join(tempfile.gettempdir(), "reviewer_ctx_*.txt"))
+        self.assertEqual(leftover, [], f"temp files not cleaned up: {leftover}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

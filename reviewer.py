@@ -11,11 +11,13 @@ Only Anthropic Messages API format is supported in this MVP (base_url configurab
 so a claude-code-deepseek proxy that speaks Anthropic format also works).
 """
 import glob as _glob_module
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -197,78 +199,140 @@ def _parse_decision(text: str) -> dict:
     return json.loads(text)
 
 
+def _spill_to_tempfile(content: str) -> str:
+    """Write large content to a temp file so the reviewer can Read/Grep it on demand."""
+    fd, path = tempfile.mkstemp(prefix="reviewer_ctx_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write(content)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _trim_tool_input_for_llm(tool_input, config: dict):
+    """Return (trimmed_tool_input, temp_files_to_cleanup).
+
+    Large string fields are spilled to a temp file and replaced inline with a
+    small preview + sha256 + size + the temp file path. Short high-signal
+    fields (file_path, command, path, ...) stay inline untouched because they
+    are below the spill threshold. The reviewer can Read/Grep the temp file if
+    it needs the full body. Caller must delete the temp files when done.
+    """
+    if not isinstance(tool_input, dict):
+        return tool_input, []
+    threshold = config.get("llm_tool_input_spill_threshold", 4000)
+    preview_chars = config.get("llm_tool_input_preview_chars", 2000)
+    temp_files = []
+    trimmed = {}
+    for k, v in tool_input.items():
+        if isinstance(v, str) and len(v) > threshold:
+            tmp = _spill_to_tempfile(v)
+            temp_files.append(tmp)
+            preview = v[:preview_chars]
+            if len(v) > preview_chars:
+                preview += "...[truncated]"
+            trimmed[k] = {
+                "_truncated": True,
+                "preview": preview,
+                "sha256": hashlib.sha256(v.encode("utf-8")).hexdigest(),
+                "size_bytes": len(v.encode("utf-8")),
+                "full_content_path": tmp,
+            }
+        else:
+            trimmed[k] = v
+    return trimmed, temp_files
+
+
 def review(tool_name: str, tool_input: dict, cwd: str, transcript_context: dict,
            config: dict, permission_mode: str) -> dict:
     """Run the reviewer agent loop. Returns {"decision": "allow"|"deny"|"ask", "reason": str}."""
-    context_json = json.dumps({
-        "permission_mode": permission_mode,
-        "cwd": cwd,
-        "pending_tool_call": {"tool_name": tool_name, "tool_input": tool_input},
-        "recent_user_prompts": transcript_context.get("recent_user_prompts", []),
-        "recent_assistant_texts": transcript_context.get("recent_assistant_texts", []),
-        "recent_tool_calls": transcript_context.get("recent_tool_calls", []),
-    }, ensure_ascii=False, indent=2)
+    trimmed_input, temp_files = _trim_tool_input_for_llm(tool_input, config)
+    try:
+        context_json = json.dumps({
+            "permission_mode": permission_mode,
+            "cwd": cwd,
+            "pending_tool_call": {"tool_name": tool_name, "tool_input": trimmed_input},
+            "recent_user_prompts": transcript_context.get("recent_user_prompts", []),
+            "recent_assistant_texts": transcript_context.get("recent_assistant_texts", []),
+            "recent_tool_calls": transcript_context.get("recent_tool_calls", []),
+        }, ensure_ascii=False, indent=2)
+        if temp_files:
+            context_json += (
+                "\n\nNote: large tool_input fields were spilled to temp files "
+                "(see full_content_path). Use the Read/Grep tools to inspect them "
+                "if the risk depends on their full content.")
 
-    user_msg = (
-        "Approve the following tool call that the main agent is about to execute.\n\n"
-        f"{context_json}\n\n"
-        "Based on this context, decide allow/deny. Investigate local state with "
-        "Read/Grep/Glob if risk depends on it. End with the decision JSON."
-    )
-    messages = [{"role": "user", "content": user_msg}]
-    max_turns = config.get("reviewer_max_turns", 3)
+        user_msg = (
+            "Approve the following tool call that the main agent is about to execute.\n\n"
+            f"{context_json}\n\n"
+            "Based on this context, decide allow/deny. Investigate local state with "
+            "Read/Grep/Glob if risk depends on it. End with the decision JSON."
+        )
+        messages = [{"role": "user", "content": user_msg}]
+        max_turns = config.get("reviewer_max_turns", 3)
 
-    for turn in range(max_turns + 1):
-        try:
-            resp = _call_llm(messages, config, REVIEWER_TOOLS)
-        except Exception as e:
-            if config.get("fail_closed", True):
-                return {"decision": "deny",
-                        "reason": f"reviewer LLM call failed (fail-closed): {e}"}
-            return {"decision": "ask", "reason": f"reviewer LLM call failed: {e}"}
-
-        content = resp.get("content", [])
-        stop_reason = resp.get("stop_reason", "")
-        text_parts, tool_uses = [], []
-        for block in content:
-            if block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif block.get("type") == "tool_use":
-                tool_uses.append(block)
-        assistant_text = "\n".join(text_parts)
-
-        if not tool_uses or stop_reason == "end_turn":
+        for turn in range(max_turns + 1):
             try:
-                d = _parse_decision(assistant_text)
-                outcome = d.get("outcome", "ask")
-                rationale = d.get("rationale", "")
-                tag = f"[risk={d.get('risk_level','?')}, auth={d.get('user_authorization','?')}]"
-                reason = f"{tag} {rationale}" if rationale else tag
-                return {"decision": outcome, "reason": reason}
-            except (json.JSONDecodeError, KeyError):
-                if turn >= max_turns:
-                    if config.get("fail_closed", True):
-                        return {"decision": "deny",
-                                "reason": f"reviewer output unparseable (fail-closed): {assistant_text[:200]}"}
-                    return {"decision": "ask", "reason": "reviewer output unparseable"}
-                messages.append({"role": "assistant", "content": assistant_text})
-                messages.append({"role": "user",
-                                 "content": 'Output could not be parsed. Reply with ONLY the JSON: {"outcome": "allow|deny", ...}'})
-                continue
+                resp = _call_llm(messages, config, REVIEWER_TOOLS)
+            except Exception as e:
+                if config.get("fail_closed", True):
+                    return {"decision": "deny",
+                            "reason": f"reviewer LLM call failed (fail-closed): {e}"}
+                return {"decision": "ask", "reason": f"reviewer LLM call failed: {e}"}
 
-        messages.append({"role": "assistant", "content": content})
-        tool_results = []
-        for tu in tool_uses:
-            res = execute_tool(tu["name"], tu.get("input", {}), cwd)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tu["id"],
-                "content": res,
-            })
-        messages.append({"role": "user", "content": tool_results})
+            content = resp.get("content", [])
+            stop_reason = resp.get("stop_reason", "")
+            text_parts, tool_uses = [], []
+            for block in content:
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_use":
+                    tool_uses.append(block)
+            assistant_text = "\n".join(text_parts)
 
-    if config.get("fail_closed", True):
-        return {"decision": "deny",
-                "reason": f"reviewer exceeded max investigation turns ({max_turns}), fail-closed deny"}
-    return {"decision": "ask",
-            "reason": f"reviewer exceeded max investigation turns ({max_turns}), needs human"}
+            if not tool_uses or stop_reason == "end_turn":
+                try:
+                    d = _parse_decision(assistant_text)
+                    outcome = d.get("outcome", "ask")
+                    rationale = d.get("rationale", "")
+                    tag = f"[risk={d.get('risk_level','?')}, auth={d.get('user_authorization','?')}]"
+                    reason = f"{tag} {rationale}" if rationale else tag
+                    return {"decision": outcome, "reason": reason}
+                except (json.JSONDecodeError, KeyError):
+                    if turn >= max_turns:
+                        if config.get("fail_closed", True):
+                            return {"decision": "deny",
+                                    "reason": f"reviewer output unparseable (fail-closed): {assistant_text[:200]}"}
+                        return {"decision": "ask", "reason": "reviewer output unparseable"}
+                    messages.append({"role": "assistant", "content": assistant_text})
+                    messages.append({"role": "user",
+                                     "content": 'Output could not be parsed. Reply with ONLY the JSON: {"outcome": "allow|deny", ...}'})
+                    continue
+
+            messages.append({"role": "assistant", "content": content})
+            tool_results = []
+            for tu in tool_uses:
+                res = execute_tool(tu["name"], tu.get("input", {}), cwd)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu["id"],
+                    "content": res,
+                })
+            messages.append({"role": "user", "content": tool_results})
+
+        if config.get("fail_closed", True):
+            return {"decision": "deny",
+                    "reason": f"reviewer exceeded max investigation turns ({max_turns}), fail-closed deny"}
+        return {"decision": "ask",
+                "reason": f"reviewer exceeded max investigation turns ({max_turns}), needs human"}
+    finally:
+        for tf in temp_files:
+            try:
+                os.remove(tf)
+            except OSError:
+                pass

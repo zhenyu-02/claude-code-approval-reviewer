@@ -93,6 +93,8 @@
     "Glob"
   ],
   "reviewer_max_turns": 3,
+  "llm_tool_input_spill_threshold": 4000,
+  "llm_tool_input_preview_chars": 2000,
   "pre_tool_use_active_modes": [
     "bypassPermissions"
   ],
@@ -114,7 +116,7 @@
   "approval_records": {
     "enabled": true,
     "file": "runtime/approval_records.jsonl",
-    "max_tool_input_chars": 4000,
+    "max_tool_input_chars": 200000,
     "redact_markers": []
   }
 }
