@@ -15,11 +15,14 @@ import hashlib
 import json
 import os
 import re
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
-import urllib.request
+import time
 import urllib.error
+import urllib.request
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -189,6 +192,36 @@ def _call_llm(messages: list, config: dict, tools: list) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+_LLM_MAX_ATTEMPTS = 3
+_LLM_RETRY_BACKOFFS = [0.5, 1.5]  # seconds before attempt 2 and 3
+_LLM_RETRY_HTTP_CODES = {408, 429, 500, 502, 503, 504}
+
+
+def _is_transient_llm_error(e: Exception) -> bool:
+    """Network/SSL/timeout/5xx/429 are worth retrying; 4xx and parse errors are not.
+    Note: HTTPError is a subclass of URLError, so check it first."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in _LLM_RETRY_HTTP_CODES
+    if isinstance(e, (urllib.error.URLError, socket.timeout, ssl.SSLError,
+                      ConnectionError, TimeoutError)):
+        return True
+    return False
+
+
+def _call_llm_with_retry(messages: list, config: dict, tools: list) -> dict:
+    """Retry transient LLM failures up to _LLM_MAX_ATTEMPTS, then re-raise so
+    the hook can defer to the human instead of denying."""
+    for attempt in range(_LLM_MAX_ATTEMPTS):
+        try:
+            return _call_llm(messages, config, tools)
+        except Exception as e:
+            if not _is_transient_llm_error(e) or attempt == _LLM_MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(_LLM_RETRY_BACKOFFS[min(attempt, len(_LLM_RETRY_BACKOFFS) - 1)])
+    # unreachable
+    raise RuntimeError("LLM retry loop exhausted")
+
+
 def _parse_decision(text: str) -> dict:
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
@@ -253,6 +286,16 @@ def review(tool_name: str, tool_input: dict, cwd: str, transcript_context: dict,
     """Run the reviewer agent loop. Returns {"decision": "allow"|"deny"|"ask", "reason": str}."""
     trimmed_input, temp_files = _trim_tool_input_for_llm(tool_input, config)
     try:
+        # TODO(discussion): Codex Guardian uses a delta transcript between
+        # successive reviews within one session (only new entries since the last
+        # cursor + a followup reminder) to reuse KV cache and cut tokens. We
+        # rebuild the full transcript every call because each hook invocation is
+        # a fresh process with no persistent session state. Adopting delta mode
+        # would need a persisted per-session cursor + careful handling of prior
+        # review decisions: earlier reviewer verdicts could drift the current
+        # decision (precedent bias), which is exactly the "instruction drift"
+        # concern. Open: is same-session self-review common enough here to justify
+        # the state + bias risk? Leave as discussion before implementing.
         context_json = json.dumps({
             "permission_mode": permission_mode,
             "cwd": cwd,
@@ -277,13 +320,10 @@ def review(tool_name: str, tool_input: dict, cwd: str, transcript_context: dict,
         max_turns = config.get("reviewer_max_turns", 3)
 
         for turn in range(max_turns + 1):
-            try:
-                resp = _call_llm(messages, config, REVIEWER_TOOLS)
-            except Exception as e:
-                if config.get("fail_closed", True):
-                    return {"decision": "deny",
-                            "reason": f"reviewer LLM call failed (fail-closed): {e}"}
-                return {"decision": "ask", "reason": f"reviewer LLM call failed: {e}"}
+            # Transient LLM failures are retried inside _call_llm_with_retry;
+            # on final failure it raises, which propagates to the hook and is
+            # deferred to the human (NOT denied).
+            resp = _call_llm_with_retry(messages, config, REVIEWER_TOOLS)
 
             content = resp.get("content", [])
             stop_reason = resp.get("stop_reason", "")

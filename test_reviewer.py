@@ -22,6 +22,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import reviewer  # noqa: E402
+import transcript  # noqa: E402
 
 
 class ExecuteToolTests(unittest.TestCase):
@@ -224,23 +225,130 @@ class ToolInputTrimTests(unittest.TestCase):
 
     def test_review_cleans_up_temp_files_even_on_llm_failure(self):
         # review() must delete spilled temp files in its finally block, even when
-        # _call_llm raises (network/crash). Monkeypatch _call_llm to raise.
+        # the LLM call ultimately fails. After the retry policy change, a
+        # non-transient LLM error propagates out of review() (the hook defers to
+        # the human). Use a non-transient error so no retry/sleep happens.
         big = "B" * 6000
         ti = {"file_path": "/tmp/big2.py", "content": big}
         original_call = reviewer._call_llm
         def _boom(*a, **k):
-            raise ConnectionError("simulated proxy outage")
+            raise ValueError("non-transient: bad API key / 4xx")
         reviewer._call_llm = _boom
+        raised = None
         try:
-            result = reviewer.review("Write", ti, "/tmp", {}, {"fail_closed": True}, "default")
+            reviewer.review("Write", ti, "/tmp", {}, {"fail_closed": True}, "default")
+        except Exception as e:
+            raised = e
         finally:
             reviewer._call_llm = original_call
-        # fail_closed -> deny on LLM failure
-        self.assertEqual(result["decision"], "deny")
-        # all spilled temp files must be gone
+        self.assertIsNotNone(raised, "review() should raise on LLM failure, not return deny")
         import glob, tempfile
         leftover = glob.glob(os.path.join(tempfile.gettempdir(), "reviewer_ctx_*.txt"))
         self.assertEqual(leftover, [], f"temp files not cleaned up: {leftover}")
+
+    def test_transient_llm_error_retried_3x_then_raises(self):
+        # ConnectionError is transient -> 3 attempts then raise. Patch sleep to
+        # no-op so the test is fast.
+        attempts = {"n": 0}
+        orig_call = reviewer._call_llm
+        orig_sleep = reviewer.time.sleep
+        def _flaky(*a, **k):
+            attempts["n"] += 1
+            raise ConnectionError("simulated proxy outage")
+        reviewer._call_llm = _flaky
+        reviewer.time.sleep = lambda _s: None
+        raised = None
+        try:
+            reviewer.review("Read", {"path": "/tmp/x"}, "/tmp", {}, {}, "default")
+        except ConnectionError as e:
+            raised = e
+        finally:
+            reviewer._call_llm = orig_call
+            reviewer.time.sleep = orig_sleep
+        self.assertEqual(attempts["n"], 3, f"expected 3 attempts, got {attempts['n']}")
+        self.assertIsNotNone(raised)
+
+    def test_non_transient_llm_error_raises_immediately(self):
+        # A 4xx-style error (HTTPError 401) must NOT be retried.
+        import urllib.error
+        attempts = {"n": 0}
+        orig_call = reviewer._call_llm
+        def _bad(*a, **k):
+            attempts["n"] += 1
+            raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        reviewer._call_llm = _bad
+        raised = None
+        try:
+            reviewer.review("Read", {"path": "/tmp/x"}, "/tmp", {}, {}, "default")
+        except urllib.error.HTTPError as e:
+            raised = e
+        finally:
+            reviewer._call_llm = orig_call
+        self.assertEqual(attempts["n"], 1, f"401 must not retry, got {attempts['n']}")
+        self.assertIsNotNone(raised)
+
+
+class TranscriptContextTests(unittest.TestCase):
+    """recent_tool_calls now keeps both the call (name+input) and the matching
+    tool_result (Codex-style evidence). Long results spill to a temp file."""
+
+    def _write_transcript(self, lines):
+        fd, path = tempfile.mkstemp(prefix="reviewer_tx_", suffix=".jsonl")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(json.dumps(l) for l in lines) + "\n")
+        return path
+
+    def test_tool_call_and_result_captured_and_paired(self):
+        big_result = "RESULT_LINE\n" * 3000  # ~33KB, above spill threshold
+        tx = self._write_transcript([
+            {"type": "user", "message": {"role": "user",
+              "content": [{"type": "text", "text": "please read the file"}]}},
+            {"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "tool_use", "id": "tu1", "name": "Read",
+                           "input": {"path": "/tmp/secret.txt"}}]}},
+            {"type": "user", "message": {"role": "user",
+              "content": [{"type": "tool_result", "tool_use_id": "tu1",
+                           "content": big_result}]}},
+        ])
+        ctx, temps = transcript.extract_context(tx, turns_to_read=2)
+        try:
+            self.assertEqual(len(ctx["recent_tool_calls"]), 1)
+            ti = ctx["recent_tool_calls"][0]
+            self.assertEqual(ti["name"], "Read")
+            self.assertEqual(ti["input"], {"path": "/tmp/secret.txt"})
+            self.assertTrue(ti["result"]["_truncated"])
+            self.assertEqual(len(temps), 1)
+            self.assertTrue(os.path.exists(temps[0]))
+            with open(temps[0]) as f:
+                self.assertEqual(f.read(), big_result)
+            self.assertTrue(ti["result"]["preview"].startswith("RESULT_LINE"))
+            self.assertTrue(ti["result"]["preview"].endswith("...[truncated]"))
+        finally:
+            for t in temps:
+                os.remove(t)
+            os.remove(tx)
+
+    def test_short_result_kept_inline_not_spilled(self):
+        tx = self._write_transcript([
+            {"type": "user", "message": {"role": "user",
+              "content": [{"type": "text", "text": "ls"}]}},
+            {"type": "assistant", "message": {"role": "assistant",
+              "content": [{"type": "tool_use", "id": "tu9", "name": "Bash",
+                           "input": {"command": "ls"}}]}},
+            {"type": "user", "message": {"role": "user",
+              "content": [{"type": "tool_result", "tool_use_id": "tu9",
+                           "content": "file1.txt\nfile2.txt"}]}},
+        ])
+        ctx, temps = transcript.extract_context(tx, turns_to_read=2)
+        try:
+            ti = ctx["recent_tool_calls"][0]
+            self.assertEqual(ti["name"], "Bash")
+            self.assertEqual(ti["result"], "file1.txt\nfile2.txt")  # inline string, not dict
+            self.assertEqual(temps, [])
+        finally:
+            for t in temps:
+                os.remove(t)
+            os.remove(tx)
 
 
 if __name__ == "__main__":

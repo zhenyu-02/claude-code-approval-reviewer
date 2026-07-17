@@ -15,8 +15,11 @@ Claude Code transcript JSONL: each line is one JSON object with fields like
 
 Run `python3 transcript.py <path> [N]` in debug mode to inspect parsing.
 """
+import hashlib
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple
@@ -26,7 +29,8 @@ from typing import List, Tuple
 class Turn:
     user_prompt: str = ""
     assistant_text: str = ""
-    tool_calls: List[str] = field(default_factory=list)
+    tool_uses: list = field(default_factory=list)      # [{id, name, input}]
+    tool_results: dict = field(default_factory=dict)   # {tool_use_id: result_text}
 
 
 def _is_real_user_message(content) -> bool:
@@ -54,12 +58,13 @@ def _extract_user_prompt(content) -> str:
     return ""
 
 
-def _extract_assistant_text(content) -> Tuple[str, List[str]]:
-    """Return (pure_text, tool_call_names). Excludes thinking blocks."""
+def _extract_assistant_text(content) -> Tuple[str, list]:
+    """Return (pure_text, tool_uses). Excludes thinking blocks.
+    tool_uses: list of {id, name, input}."""
     if isinstance(content, str):
         return content.strip(), []
     if isinstance(content, list):
-        texts, tool_names = [], []
+        texts, tool_uses = [], []
         for b in content:
             if not isinstance(b, dict):
                 continue
@@ -67,10 +72,35 @@ def _extract_assistant_text(content) -> Tuple[str, List[str]]:
             if t == "text":
                 texts.append(b.get("text", ""))
             elif t == "tool_use":
-                tool_names.append(b.get("name", ""))
+                tool_uses.append({
+                    "id": b.get("id", ""),
+                    "name": b.get("name", ""),
+                    "input": b.get("input", {}),
+                })
             # "thinking" blocks are intentionally skipped
-        return "\n".join(s for s in texts if s).strip(), tool_names
+        return "\n".join(s for s in texts if s).strip(), tool_uses
     return "", []
+
+
+def _extract_tool_results(content) -> dict:
+    """Return {tool_use_id: result_text} from a user message's tool_result blocks."""
+    out = {}
+    if isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_result":
+                continue
+            tid = b.get("tool_use_id", "")
+            raw = b.get("content", "")
+            if isinstance(raw, list):
+                # content may be a list of text blocks
+                raw = "\n".join(
+                    x.get("text", "") for x in raw
+                    if isinstance(x, dict) and x.get("type") == "text")
+            if not isinstance(raw, str):
+                raw = json.dumps(raw, ensure_ascii=False) if raw is not None else ""
+            if tid:
+                out[tid] = raw
+    return out
 
 
 def parse_transcript(path: str, tail_bytes: int = 256 * 1024) -> list:
@@ -97,7 +127,13 @@ def parse_transcript(path: str, tail_bytes: int = 256 * 1024) -> list:
 
 
 def build_turns(entries: list) -> List[Turn]:
-    """Group transcript entries into turns (one user prompt + following assistant reply)."""
+    """Group transcript entries into turns (one user prompt + following assistant reply).
+
+    Captures assistant tool_use blocks (name + input + id) and the matching
+    tool_result passbacks (paired by tool_use_id). tool_results live in user-role
+    messages that _is_real_user_message filters out as "not real human input";
+    we still mine them for evidence before discarding the message as a prompt.
+    """
     turns: List[Turn] = []
     current: Turn = None
     for entry in entries:
@@ -107,6 +143,10 @@ def build_turns(entries: list) -> List[Turn]:
         content = message.get("content")
 
         if role == "user" or etype == "user":
+            # tool_result passback: capture evidence, do NOT start a new turn
+            results = _extract_tool_results(content)
+            if results and current is not None:
+                current.tool_results.update(results)
             if _is_real_user_message(content):
                 if current is not None:
                     turns.append(current)
@@ -114,11 +154,11 @@ def build_turns(entries: list) -> List[Turn]:
         elif role == "assistant" or etype == "assistant":
             if current is None:
                 current = Turn()
-            text, tool_names = _extract_assistant_text(content)
+            text, tool_uses = _extract_assistant_text(content)
             if text:
                 current.assistant_text = (current.assistant_text + "\n" + text).strip() \
                     if current.assistant_text else text
-            current.tool_calls.extend(tool_names)
+            current.tool_uses.extend(tool_uses)
     if current is not None:
         turns.append(current)
     return turns
@@ -130,46 +170,82 @@ def _truncate(s: str, max_chars: int) -> str:
     return s[:max_chars] + "...[truncated]"
 
 
+def _spill_result_to_tempfile(text: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="reviewer_ctx_result_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def extract_context(transcript_path: str, turns_to_read: int = 2,
                     max_user_chars: int = 500,
-                    max_assistant_chars: int = 1000) -> dict:
+                    max_assistant_chars: int = 1000,
+                    tool_result_spill_threshold: int = 4000,
+                    tool_result_preview_chars: int = 2000):
     """Build the reviewer context dict.
 
-    Returns:
-      {
-        "recent_user_prompts":   [str, ...],   # last N turns' human prompts
-        "recent_assistant_texts":[str, ...],   # last N turns' assistant pure text
-        "recent_tool_calls":     [str, ...],   # recent tool names (deduped, max 10)
-      }
+    Returns (context_dict, temp_files_to_cleanup).
+
+    recent_tool_calls now keeps BOTH the call (name + input) AND the matching
+    tool_result, so the reviewer has the evidence the agent gathered (Codex-style).
+    Long tool_results are spilled to a temp file and only a small preview +
+    sha256 + size + temp path is kept inline; the reviewer can Read/Grep the temp
+    file. Caller must delete temp_files when done.
     """
+    empty = {"recent_user_prompts": [], "recent_assistant_texts": [],
+             "recent_tool_calls": []}
     if not transcript_path:
-        return {"recent_user_prompts": [], "recent_assistant_texts": [], "recent_tool_calls": []}
+        return empty, []
     entries = parse_transcript(transcript_path)
     turns = build_turns(entries)
     recent = turns[-turns_to_read:] if len(turns) > turns_to_read else turns
 
-    user_prompts, assistant_texts, all_tools = [], [], []
+    user_prompts, assistant_texts, tool_interactions = [], [], []
+    temp_files = []
     for t in recent:
         if t.user_prompt:
             user_prompts.append(_truncate(t.user_prompt, max_user_chars))
         if t.assistant_text:
             assistant_texts.append(_truncate(t.assistant_text, max_assistant_chars))
-        all_tools.extend(t.tool_calls)
-
-    seen, recent_tools = set(), []
-    for name in reversed(all_tools):
-        if name and name not in seen:
-            seen.add(name)
-            recent_tools.append(name)
-        if len(recent_tools) >= 10:
-            break
-    recent_tools.reverse()
+        for tu in t.tool_uses:
+            name = tu.get("name", "")
+            tid = tu.get("id", "")
+            raw_result = t.tool_results.get(tid, "") if tid else ""
+            result_field = None
+            if raw_result:
+                if len(raw_result) > tool_result_spill_threshold:
+                    tmp = _spill_result_to_tempfile(raw_result)
+                    temp_files.append(tmp)
+                    preview = raw_result[:tool_result_preview_chars]
+                    if len(raw_result) > tool_result_preview_chars:
+                        preview += "...[truncated]"
+                    result_field = {
+                        "_truncated": True,
+                        "preview": preview,
+                        "sha256": hashlib.sha256(raw_result.encode("utf-8")).hexdigest(),
+                        "size_bytes": len(raw_result.encode("utf-8")),
+                        "full_content_path": tmp,
+                    }
+                else:
+                    result_field = raw_result
+            tool_interactions.append({
+                "name": name,
+                "input": tu.get("input", {}),
+                "result": result_field,
+            })
 
     return {
         "recent_user_prompts": user_prompts,
         "recent_assistant_texts": assistant_texts,
-        "recent_tool_calls": recent_tools,
-    }
+        "recent_tool_calls": tool_interactions,
+    }, temp_files
 
 
 if __name__ == "__main__":
@@ -178,5 +254,12 @@ if __name__ == "__main__":
         sys.exit(1)
     path = sys.argv[1]
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    ctx = extract_context(path, turns_to_read=n)
-    print(json.dumps(ctx, indent=2, ensure_ascii=False))
+    ctx, temps = extract_context(path, turns_to_read=n)
+    try:
+        print(json.dumps(ctx, indent=2, ensure_ascii=False))
+    finally:
+        for tf in temps:
+            try:
+                os.remove(tf)
+            except OSError:
+                pass

@@ -110,12 +110,15 @@ def main():
         return
 
     # 5) LLM review
+    ctx_temp_files = []
     try:
-        ctx = extract_context(
+        ctx, ctx_temp_files = extract_context(
             transcript_path,
             turns_to_read=config.get("turns_to_read", 2),
             max_user_chars=config.get("max_user_prompt_chars", 500),
             max_assistant_chars=config.get("max_assistant_text_chars", 1000),
+            tool_result_spill_threshold=config.get("llm_tool_input_spill_threshold", 4000),
+            tool_result_preview_chars=config.get("llm_tool_input_preview_chars", 2000),
         )
     except Exception as e:
         log(config, "ERROR", f"transcript extract failed: {e}")
@@ -124,13 +127,19 @@ def main():
     try:
         result = review(tool_name, tool_input, cwd, ctx, config, permission_mode)
     except Exception as e:
-        # Reviewer itself failed (network error, crash, bug, ...). Do NOT deny:
-        # defer to the human via native flow. Still count toward the circuit
-        # breaker so a sustained outage trips it and stops burning LLM calls.
+        # Reviewer itself failed (network error after retries, crash, bug, ...).
+        # Do NOT deny: defer to the human via native flow. Still count toward the
+        # circuit breaker so a sustained outage trips it and stops burning LLM calls.
         log(config, "ERROR", f"review failed, deferring to human: {tool_name} - {e}")
         circuit_breaker_record(config, session_id, denied=True)
         _record(config, hook_input, "passthrough", "review_error", str(e))
         sys.exit(0)
+    finally:
+        for tf in ctx_temp_files:
+            try:
+                os.remove(tf)
+            except OSError:
+                pass
 
     decision = result["decision"]
     reason = result.get("reason", "")
