@@ -14,6 +14,7 @@ Run:
     python3 -m unittest test_reviewer -v
     python3 test_reviewer.py
 """
+import json
 import os
 import sys
 import tempfile
@@ -100,6 +101,66 @@ class NoShadowingTests(unittest.TestCase):
             self.fail(f"execute_tool(Glob) raised AttributeError "
                       f"(shadowing regression?): {e}")
         self.assertIsInstance(out, str)
+
+
+class PermissionRequestDeferOnErrorTests(unittest.TestCase):
+    """When review() raises (network error / reviewer crash / bug), the
+    PermissionRequest hook must defer to the human via native flow and must
+    NOT emit a deny. Regression for the policy change after the glob incident,
+    where upstream DeepSeek proxy blips and the glob bug both caused false
+    fail-closed denies of legitimate tool calls."""
+
+    def _run_hook(self, hook_input, side_effect):
+        import importlib, io
+        import hook_permission_request as hpr
+        importlib.reload(hpr)  # reset patched names from any prior test
+        # neutralize all I/O / state side effects
+        hpr.log = lambda *a, **k: None
+        hpr.record_approval = lambda *a, **k: None
+        hpr.circuit_breaker_record = lambda *a, **k: None
+        hpr.circuit_breaker_check = lambda *a, **k: None
+        hpr.check_hard_deny = lambda *a, **k: None
+        hpr.check_agent_created_file = lambda *a, **k: False
+        hpr.check_fast_path_allow = lambda *a, **k: False
+        hpr.extract_context = lambda *a, **k: {}
+        hpr.load_config = lambda: {"fail_closed": True}
+        hpr.resolve_session_id = lambda x: "test-sid"
+        def _raise(*a, **k):
+            raise side_effect
+        hpr.review = _raise
+
+        old_in, old_out = sys.stdin, sys.stdout
+        sys.stdin = io.StringIO(json.dumps(hook_input))
+        buf = io.StringIO()
+        sys.stdout = buf
+        raised = None
+        try:
+            hpr.main()
+        except SystemExit as e:
+            raised = e
+        finally:
+            sys.stdin, sys.stdout = old_in, old_out
+        return buf.getvalue(), raised
+
+    def _base_input(self, tool_name, tool_input):
+        return {"tool_name": tool_name, "tool_input": tool_input,
+                "cwd": "/tmp", "permission_mode": "default",
+                "session_id": "s1", "transcript_path": ""}
+
+    def test_network_error_defers_not_denies(self):
+        out, raised = self._run_hook(
+            self._base_input("Bash", {"command": "ls"}),
+            ConnectionError("Connection reset by peer"))
+        self.assertNotIn("deny", out)
+        self.assertNotIn("behavior", out)  # no decision emitted -> native flow
+        self.assertEqual(raised.code if raised else 0, 0)
+
+    def test_reviewer_crash_defers_not_denies(self):
+        out, raised = self._run_hook(
+            self._base_input("Write", {"file_path": "/tmp/x", "content": "y"}),
+            AttributeError("'function' object has no attribute 'glob'"))
+        self.assertNotIn("deny", out)
+        self.assertEqual(raised.code if raised else 0, 0)
 
 
 if __name__ == "__main__":

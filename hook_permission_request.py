@@ -124,14 +124,13 @@ def main():
     try:
         result = review(tool_name, tool_input, cwd, ctx, config, permission_mode)
     except Exception as e:
-        if config.get("fail_closed", True):
-            circuit_breaker_record(config, session_id, denied=True)
-            _record(config, hook_input, "deny", "review_error", str(e))
-            _emit_deny(f"[reviewer] review failed (fail-closed): {e}")
-        else:
-            _record(config, hook_input, "passthrough", "review_error", str(e))
-            sys.exit(0)
-        return
+        # Reviewer itself failed (network error, crash, bug, ...). Do NOT deny:
+        # defer to the human via native flow. Still count toward the circuit
+        # breaker so a sustained outage trips it and stops burning LLM calls.
+        log(config, "ERROR", f"review failed, deferring to human: {tool_name} - {e}")
+        circuit_breaker_record(config, session_id, denied=True)
+        _record(config, hook_input, "passthrough", "review_error", str(e))
+        sys.exit(0)
 
     decision = result["decision"]
     reason = result.get("reason", "")
