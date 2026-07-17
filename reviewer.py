@@ -10,7 +10,7 @@ Borrows from Codex Guardian:
 Only Anthropic Messages API format is supported in this MVP (base_url configurable,
 so a claude-code-deepseek proxy that speaks Anthropic format also works).
 """
-import glob as _glob
+import glob as _glob_module
 import json
 import os
 import re
@@ -127,7 +127,7 @@ def _grep(pattern: str, path: str = ".") -> str:
 
 
 def _glob(pattern: str) -> str:
-    matches = _glob.glob(pattern, recursive=True)[:50]
+    matches = _glob_module.glob(pattern, recursive=True)[:50]
     return "\n".join(matches) if matches else "[no matches]"
 
 
